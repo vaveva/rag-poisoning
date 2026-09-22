@@ -1,0 +1,64 @@
+
+[execution]
+python = "python"
+runs_dir = "runs_non_agentic_deepseek"
+cache_dir = ".biaschain_cache"
+max_retries = 2
+retry_backoff_seconds = 30
+stage_timeout_minutes = 0
+fail_fast = false
+stance_model = "ollama:gemma4:latest"
+
+[matrix]
+datasets = ["wiki_balance", "procon"]
+generators = ["openrouter"]
+attack_methods = ["biaschain", "poisonedrag", "prompt_injection", "simple_prompt_injection"]
+target_stances = ["PRO", "CON"]
+embedders = ["nomic"]
+agentic_rag = [false]
+n_questions = 40
+runs_per_question = 10
+seed = 67
+top_k = 5
+
+[dataset.wiki_balance]
+query_file = "data/naturalqueries.jsonl"
+corpus_files = ["data/naturalcorpus.jsonl"]
+collection_name = "naturalcorpus"
+
+[dataset.wiki_balance.clean_databases]
+nomic = "chroma_db_nomic_natural"
+qwen = "chroma_db_qwen3_embedding_4b_natural"
+
+[dataset.procon]
+query_file = "data/procon_queries.jsonl"
+corpus_files = ["data/procon_corpus.jsonl"]
+collection_name = "procon"
+
+[dataset.procon.clean_databases]
+nomic = "chroma_db_nomic_procon"
+qwen = "chroma_db_qwen3_embedding_4b_procon"
+
+[model.ollama]
+name = "llama3.1:8b"
+
+[model.openrouter]
+name = "deepseek/deepseek-v4-flash-0731"
+
+[embedder.nomic]
+name = "nomic-embed-text"
+
+[embedder.qwen]
+name = "qwen3-embedding:4b"
+
+[baseline.poisonedrag]
+source_file = ""
+iterations = 50
+
+[baseline.prompt_injection]
+source_file = ""
+
+
+[baseline.simple_prompt_injection]
+source_file = ""
+

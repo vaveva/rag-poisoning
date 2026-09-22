@@ -1,0 +1,14 @@
+pandas
+tqdm
+matplotlib
+pydantic
+langchain
+langchain-ollama
+langchain-chroma
+langchain-openrouter
+langchain-text-splitters
+scikit-learn
+sentence-transformers
+# Required for FlippedRAG surrogate training; also used by perplexity support.
+torch
+transformers
