@@ -1,13 +1,13 @@
 # BiasChain experiment orchestration
 
-The new orchestrated path replaces manual flag editing with a TOML experiment matrix. It runs each experiment as four isolated, resumable stages:
+The orchestrated path runs each experiment as four isolated, resumable stages:
 
 1. build poisoned documents;
 2. run poisoned RAG;
 3. run or restore cached clean RAG;
 4. classify both outputs and write metrics.
 
-The four original `rag*.py` files remain available for old manual runs. The orchestrator uses `document_builder.py` and the consolidated `rag_runner.py`, which avoid their shared-global-output and import-time database side effects.
+The orchestrator uses `document_builder.py` and the consolidated `rag_runner.py`, which avoid their shared-global-output and import-time database side effects.
 
 ## First run
 
@@ -29,6 +29,14 @@ python biaschain_orchestrator.py run --config experiments.full.toml
 ```
 
 All Ollama generator, embedding, and stance-classifier models referenced by the chosen configuration must already be available to Ollama.
+
+## Duplicate phrase filtering and semantic clustering
+
+Running the duplicate phrase filtering or semantic clustering filtering defenses requires building new Chroma databases. If you have previously run experiments without the filtering defenses, the built databases need to be either deleted or renamed, so that the database building is triggered again.
+
+To run the filtering defenses, use the following arguments in the `toml` file under the `[execution]` block:
+- For duplicate phrase filtering, use `duplicate_defense = true`
+- For semantic clustering filtering, use `clustering_defense = true`
 
 ## Perplexity filtering
 
