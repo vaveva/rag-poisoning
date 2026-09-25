@@ -18,6 +18,9 @@ from scipy.sparse.csgraph import connected_components
 from collections import defaultdict
 from typing import Callable, Dict, List, Sequence
 from sklearn.preprocessing import normalize
+from sklearn.cluster import AgglomerativeClustering
+import re
+
 
 from typing import Callable, List, Optional, Sequence
 
@@ -237,10 +240,10 @@ def initialize_generator(provider: str, model_name: str, temperature: float, max
         #The parameters temperature and reasoning should be removed if using GPT-5.6 Luna
         return ChatOpenRouter(
             model=model_name,
-            temperature=temperature,
+            #temperature=temperature,
             max_tokens=max_tokens,
             max_retries=retries,
-            reasoning={"effort": "none"},
+            #reasoning={"effort": "none"},
             openrouter_provider={
                 "sort": "throughput",
                 "require_parameters": True,
@@ -265,7 +268,6 @@ def drop_shared_phrase_documents(
         if cluster_count > max_documents:
             triggered_clusters.append(cluster)
             blocked_indices.update(doc_indices)
-
     kept = [
         document
         for index, document in enumerate(documents)
@@ -302,7 +304,7 @@ def shared_phrase_clusters(
     documents: Sequence,
     similarity_threshold: float = 0.95,
     min_documents: int = 30,
-    min_words: int = 6,
+    min_words: int = 10,
 ) -> List[dict]:
     phrase_documents: dict[str, set[int]] = defaultdict(set)
 
@@ -375,61 +377,88 @@ def shared_phrase_clusters(
     clusters.sort(key=lambda cluster: cluster["count"], reverse=True)
     return clusters
 
-def shared_semantic_clusters(
-    documents: Sequence,
-    embed_fn: Callable[[str], Sequence[float]],
-    similarity_threshold: float = 0.90,
-    min_documents: int = 30,
-) -> List[dict]:
-    """
-    Cluster documents by embedding similarity rather than shared literal
-    phrases. Catches paraphrased / LLM-rewritten poisoned docs (e.g.
-    CorruptRAG-AK) that push the same claim without sharing surface text.
-    """
-    texts = [doc.page_content for doc in documents]
-    if len(texts) < 2:
-        return []
-
-    embeddings = np.array(embed_fn(texts))
-    embeddings = normalize(embeddings, norm="l2")
-    distance_threshold = 1.0 - similarity_threshold
-
-    neighbors = NearestNeighbors(
-        metric="cosine",
-        radius=distance_threshold,
-        n_jobs=-1,
-    )
-    neighbors.fit(embeddings)
-
-    adjacency = neighbors.radius_neighbors_graph(embeddings, mode="connectivity")
-    adjacency.setdiag(False)
-    adjacency.eliminate_zeros()
-
-    _, labels = connected_components(adjacency, directed=False)
-
-    clusters_by_label: Dict[int, List[int]] = defaultdict(list)
-    for doc_index, label in enumerate(labels):
-        clusters_by_label[int(label)].append(doc_index)
-
-    clusters = []
-    for doc_indices in clusters_by_label.values():
-        if len(doc_indices) >= min_documents:
-            example = documents[doc_indices[0]].page_content
-            clusters.append(
-                {
-                    "example_phrase": " ".join(example.split())[:180],
-                    "doc_indices": sorted(doc_indices),
-                    "count": len(doc_indices),
-                }
-            )
-
-    clusters.sort(key=lambda cluster: cluster["count"], reverse=True)
-    return clusters
-
 def normalize_text(text: str) -> str:
     text = (text or "").strip()
     text = " ".join(text.split())
-    return text.lower()
+    text = text.lower()
+    text = re.sub(r"[^\w\s]", " ", text)
+    return " ".join(text.split())
+
+from itertools import combinations
+
+def drop_template_documents(
+    documents: Sequence,
+    min_words: int = 6,
+    min_doc_frequency: int = 3,
+    df_ratio: float = 0.02,
+    min_template_shingles: int = 3,
+) -> list:
+    """Symmetric boilerplate defense.
+
+    All statistics come from the batch being screened:
+      1. A shingle is 'widely shared' if it appears in >= df_floor documents,
+         df_floor = max(min_doc_frequency, df_ratio * N).
+      2. A document is dropped only if it contains min_template_shingles
+         widely shared shingles whose co-occurrence appears in >= df_floor
+         documents — i.e. it instantiates a repeated template, rather than
+         merely using common phrases.
+    """
+    n_docs = len(documents)
+    df_floor = max(min_doc_frequency, math.ceil(df_ratio * n_docs))
+
+    shingle_docs: dict[str, set[int]] = defaultdict(set)
+    doc_shingles: list[set[str]] = []
+    for doc_index, document in enumerate(documents):
+        shingles = set(extract_phrases(document.page_content, min_words))
+        doc_shingles.append(shingles)
+        for shingle in shingles:
+            shingle_docs[shingle].add(doc_index)
+
+    shared = {
+        shingle
+        for shingle, doc_indices in shingle_docs.items()
+        if len(doc_indices) >= df_floor
+    }
+    print(
+        f"Template defense: {n_docs} docs | df_floor={df_floor} | "
+        f"{len(shared)} widely shared {min_words}-gram shingles"
+    )
+
+    dropped, kept = [], []
+    templates: dict[tuple[str, ...], int] = {}
+    for doc_index, document in enumerate(documents):
+        hits = sorted(doc_shingles[doc_index] & shared)
+        triggered = None
+        if len(hits) >= min_template_shingles:
+            for combo in combinations(hits, min_template_shingles):
+                support = shingle_docs[combo[0]]
+                for shingle in combo[1:]:
+                    support = support & shingle_docs[shingle]
+                    if len(support) < df_floor:
+                        break
+                if len(support) >= df_floor:
+                    triggered = combo
+                    templates[combo] = len(support)
+                    break
+        if triggered is not None:
+            dropped.append((doc_index, triggered))
+        else:
+            kept.append(document)
+
+    if templates:
+        print(f"Template defense: {len(templates)} repeated template(s):")
+        for combo, support in sorted(templates.items(), key=lambda kv: -kv[1])[:10]:
+            print(f"    support={support:4d}  {combo}")
+    if dropped:
+        print(f"Template defense dropped {len(dropped)} of {n_docs} documents:")
+        for doc_index, _ in dropped[:10]:
+            preview = " ".join((documents[doc_index].page_content or "").split())
+            print(f"  * dropped doc[{doc_index}]: {preview[:140]}")
+        if len(dropped) > 10:
+            print(f"    ... and {len(dropped) - 10} more")
+    else:
+        print("Template defense: nothing dropped")
+    return kept
 
 def run(args: argparse.Namespace) -> None:
     import pandas as pd
@@ -473,24 +502,25 @@ def run(args: argparse.Namespace) -> None:
             )
 
         if args.duplicate_defense:
-            clusters = shared_phrase_clusters(
+            raw_documents = drop_template_documents(raw_documents)
+            """clusters = shared_phrase_clusters(
                 raw_documents,
-                similarity_threshold=0.95,
-                min_documents=30,
-                min_words=10,
+                similarity_threshold=0.80,
+                min_documents=10,
+                min_words=6,
             )
             raw_documents = drop_shared_phrase_documents(
                 raw_documents,
                 clusters,
-                max_documents=30,
-            )
+                max_documents=10,
+            )"""
 
         if args.clustering_defense:
             clusters = shared_semantic_clusters(raw_documents, embedding.embed_documents)
             raw_documents = drop_shared_phrase_documents(
                 raw_documents,
                 clusters,
-                max_documents=30,
+                max_documents=35,
             )
 
         chunks = splitter.split_documents(raw_documents)
@@ -503,24 +533,18 @@ def run(args: argparse.Namespace) -> None:
 
     poisoned_documents, topics = load_poisoned_documents(args.poisoned_docs, Document)
     if args.duplicate_defense:
-        clusters = shared_phrase_clusters(
+        poisoned_documents = drop_template_documents(poisoned_documents)
+        """clusters = shared_phrase_clusters(
                 poisoned_documents,
-                similarity_threshold=0.95,
-                min_documents=30,
-                min_words=10,
+                similarity_threshold=0.80,
+                min_documents=10,
+                min_words=6,
             )
         poisoned_documents = drop_shared_phrase_documents(
                 poisoned_documents,
                 clusters,
-                max_documents=30,
-        )
-    if args.clustering_defense:
-        clusters = shared_semantic_clusters(raw_documents, embedding.embed_documents)
-        poisoned_documents = drop_shared_phrase_documents(
-                poisoned_documents,
-                clusters,
-                max_documents=30,
-        )
+                max_documents=10,
+        )"""
 
     if args.condition == "poisoned":
         if args.poisoned_db is None:
@@ -664,7 +688,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--request-retries", type=int, default=3)
     parser.add_argument("--duplicate-defense", action="store_true")
     parser.add_argument("--perplexity-defense", action="store_true")
-    parser.add_argument("--clustering-defense", action="store_true")
     return parser.parse_args()
 
 

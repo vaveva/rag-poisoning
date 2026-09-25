@@ -32,7 +32,7 @@ METHOD_ALIASES = {
     "biaschain": "biaschain",
     "poisonedrag": "poisonedrag",
     "ebi": "ebi",
-    "prompt_injection": "prompt_injection",
+    "corruptrag": "corruptrag",
     "simple_prompt_injection": "simple_prompt_injection",
 }
 
@@ -148,7 +148,7 @@ class Orchestrator:
             "PoisonedRAG.py",
             "EBI.py",
             "duo.py",
-            "prompt_injection.py",
+            "corruptRAG.py",
             "simple_prompt_injection.py",
         ]
         self.code_signature = digest(
@@ -672,6 +672,9 @@ class Orchestrator:
                 "duo_embedding_model", "sentence-transformers/all-MiniLM-L6-v2"
             )
             command.extend(["--ebi-duo-embedding-model", str(duo_model)])
+        if experiment.attack_method == "corruptrag":
+            if bool(self.baselines.get("corruptrag", {}).get("run_corruptrag_ak", False)):
+                command.append("--run-corruptrag-ak")
         source = self.source_file(experiment)
         if source:
             command.extend(["--source-file", str(source)])

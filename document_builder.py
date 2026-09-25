@@ -22,7 +22,7 @@ METHOD_ALIASES = {
     "biaschain": "biaschain",
     "poisonedrag": "poisonedrag",
     "ebi": "ebi",
-    "prompt_injection": "prompt_injection",
+    "corruptrag": "corruptrag",
     "simple_prompt_injection": "simple_prompt_injection",
 }
 
@@ -96,10 +96,10 @@ def compose_poisoned_docs(method: str, output_dir: Path) -> Path:
     elif method == "ebi":
         result = read_table(output_dir / "EBI_results.csv")
         result["poisoned_doc"] = result["poisoned"].fillna("").str.strip()
-    elif method in {"prompt_injection", "simple_prompt_injection"}:
+    elif method in {"corruptrag", "simple_prompt_injection"}:
         filename = (
-            "prompt_injection_results.csv"
-            if method == "prompt_injection"
+            "corruptrag_results.csv"
+            if method == "corruptrag"
             else "simple_prompt_injection_results.csv"
         )
         result = read_table(output_dir / filename)
@@ -146,7 +146,7 @@ def build_documents(args: argparse.Namespace) -> Path:
 
     if args.source_file and method in {"poisonedrag"}:
         normalize_intent_source(args.source_file.resolve(), intent_path, target_stance)
-    elif method not in {"prompt_injection", "simple_prompt_injection"} or not args.source_file:
+    elif method not in {"corruptrag", "simple_prompt_injection"} or not args.source_file:
         from intent_agent import run_intent_agent
 
         run_intent_agent(
@@ -183,14 +183,15 @@ def build_documents(args: argparse.Namespace) -> Path:
             output_path=output_dir / "EBI_results.csv",
             duo_embedding_model=args.ebi_duo_embedding_model,
         )
-    elif method == "prompt_injection":
-        from prompt_injection import run_prompt_injection_baseline
+    elif method == "corruptrag":
+        from corruptRAG import run_corruptrag_baseline
 
         source = args.source_file.resolve() if args.source_file else intent_path
-        run_prompt_injection_baseline(
+        run_corruptrag_baseline(
             target_stance,
             source_path=str(source),
-            output_path=output_dir / "prompt_injection_results.csv",
+            output_path=output_dir / "corruptrag_results.csv",
+            run_corruptrag_ak=args.run_corruptrag_ak,
         )
     elif method == "simple_prompt_injection":
         from simple_prompt_injection import run_simple_prompt_injection
@@ -223,6 +224,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ebi-duo-embedding-model",
         default="sentence-transformers/all-MiniLM-L6-v2",
+    )
+    parser.add_argument(
+        "--run-corruptrag-ak",
+        action="store_true",
+        help="Apply the corruptrag_ak LLM revision step (opt-in via [baseline.corruptrag])",
     )
     return parser.parse_args()
 
