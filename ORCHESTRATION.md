@@ -36,7 +36,6 @@ Running the duplicate phrase filtering or semantic clustering filtering defenses
 
 To run the filtering defenses, use the following arguments in the `toml` file under the `[execution]` block:
 - For duplicate phrase filtering, use `duplicate_defense = true`
-- For semantic clustering filtering, use `clustering_defense = true`
 
 ## Perplexity filtering
 
@@ -106,7 +105,7 @@ iterations = 10
 source_file = "path/to/prior_rag_answers.csv"
 ```
 
-PoisonedRAG and FlippedRAG sources are normalized into the intent-agent schema. FlippedRAG additionally writes `FlippedRAG_imitation_pairs.json` containing its pseudo-relevant query/positive pairs. Prompt-injection sources may be either a RAG-answer CSV (`query_idx` and `rephrased_query`) or an intent-agent CSV (`idx` and `topic`).
+PoisonedRAG sources are normalized into the intent-agent schema. Prompt-injection sources may be either a RAG-answer CSV (`query_idx` and `rephrased_query`) or an intent-agent CSV (`idx` and `topic`).
 
 If PRO and CON were sampled into separate files, configure both explicitly. A source containing a `stance` column is filtered to the current target stance and fails clearly when no matching rows exist.
 
@@ -115,19 +114,3 @@ If PRO and CON were sampled into separate files, configure both explicitly. A so
 source_files = { PRO = "sources/pro_intents.csv", CON = "sources/con_intents.csv" }
 iterations = 10
 ```
-
-## Editing the matrix
-
-The keys corresponding to the old flags are now:
-
-| Old flag | Configuration / behavior |
-| --- | --- |
-| `BUILD_NEW_DOCS` | document stage cache plus `--force-stage documents` |
-| `USE_POISONED_DB` | automatic poisoned and clean stages |
-| `POISONED_DOC_METHOD` | `matrix.attack_methods` |
-| `TARGET_STANCE` | `matrix.target_stances` |
-| `EMBEDDER_NAME` | `matrix.embedders` |
-| `USE_AGENT_RAG` | `matrix.agentic_rag` |
-| `N_QUESTIONS` | `matrix.n_questions` |
-
-The former two filename flags in `stats.py` are no longer used by orchestration. Every evaluation path is passed explicitly, and the statistics stage writes machine-readable `metrics.json`.
