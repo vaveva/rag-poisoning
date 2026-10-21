@@ -8,17 +8,17 @@ import json
 import os
 import shutil
 from pathlib import Path
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.neighbors import NearestNeighbors
+from sklearn.neighbors import LocalOutlierFactor, NearestNeighbors
 from scipy.sparse.csgraph import connected_components
 from collections import defaultdict
 from typing import Callable, Dict, List, Sequence
 from sklearn.preprocessing import normalize
-from sklearn.cluster import AgglomerativeClustering
+from sklearn.cluster import AgglomerativeClustering, DBSCAN
 import re
 
 
@@ -44,94 +44,210 @@ LLM_SYSTEM_PROMPT = (
     "question as accurately and objectively as possible."
 )
 
-class GPT2PerplexityScorer:
-    def __init__(
-        self,
-        model_name: str,
-        device_name: str,
-        stride: int,
-    ) -> None:
-        try:
-            import torch
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-        except ImportError as error:
-            raise RuntimeError(
-                "Perplexity scoring requires torch and transformers"
-            ) from error
-
-        self.torch = torch
-        if device_name == "auto":
-            device_name = "cuda" if torch.cuda.is_available() else "cpu"
-        if device_name == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError("--device cuda was requested, but CUDA is unavailable")
-
-        self.device = torch.device(device_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(model_name)
-        self.model.to(self.device)
-        self.model.eval()
-        self.maximum_length = int(
-            getattr(self.model.config, "n_positions", self.tokenizer.model_max_length)
-        )
-        if stride <= 0 or stride > self.maximum_length:
-            raise ValueError(
-                f"Stride must be between 1 and {self.maximum_length}, received {stride}"
-            )
-        self.stride = stride
-        print(
-            f"Loaded {model_name} on {self.device}; "
-            f"maximum context={self.maximum_length}, stride={self.stride}"
-        )
-
-    def score(self, text: str) -> tuple[float, float, int]:
-        """Return raw PPL, log PPL, and predicted-token count for one document."""
-        torch = self.torch
-        text = str(text).strip()
-        if not text:
-            raise ValueError("Cannot calculate perplexity for empty text")
-
-        encoded = self.tokenizer(text, return_tensors="pt")
-        all_input_ids = encoded["input_ids"].to(self.device)
-        sequence_length = all_input_ids.size(1)
-        if sequence_length < 2:
-            raise ValueError("Text must contain at least two GPT-2 tokens")
-
-        total_negative_log_likelihood = 0.0
-        total_predicted_tokens = 0
-        previous_end = 0
-
-        with torch.inference_mode():
-            for begin in range(0, sequence_length, self.stride):
-                end = min(begin + self.maximum_length, sequence_length)
-                target_length = end - previous_end
-                input_ids = all_input_ids[:, begin:end]
-                target_ids = input_ids.clone()
-                target_ids[:, :-target_length] = -100
-
-                output = self.model(input_ids=input_ids, labels=target_ids)
-                # Causal-LM loss predicts labels[1:] from input_ids[:-1].
-                predicted_tokens = int((target_ids[:, 1:] != -100).sum().item())
-                if predicted_tokens > 0:
-                    total_negative_log_likelihood += (
-                        float(output.loss.item()) * predicted_tokens
-                    )
-                    total_predicted_tokens += predicted_tokens
-
-                previous_end = end
-                if end == sequence_length:
-                    break
-
-        if total_predicted_tokens == 0:
-            raise ValueError("No tokens were available for causal prediction")
-
-        log_perplexity = total_negative_log_likelihood / total_predicted_tokens
-        perplexity = math.exp(log_perplexity)
-        return perplexity, log_perplexity, total_predicted_tokens
-
 @dataclass(frozen=True)
 class Phrase:
     doc_index: int
     text: str
+
+class DBSCANDocumentFilter:
+    def __init__(
+        self,
+        embedding_function,
+        eps: float,
+        min_samples: int,
+        metric: str,
+        drop_noise: bool,
+        min_cluster_size: int,
+        keep_if_all_filtered: bool,
+    ) -> None:
+        if eps <= 0:
+            raise ValueError("DBSCAN eps must be positive")
+        if min_samples < 1:
+            raise ValueError("DBSCAN min_samples must be at least 1")
+        if min_cluster_size < 1:
+            raise ValueError("DBSCAN min_cluster_size must be at least 1")
+        if metric not in {"cosine", "euclidean"}:
+            raise ValueError("DBSCAN metric must be 'cosine' or 'euclidean'")
+
+        self.embedding_function = embedding_function
+        self.eps = eps
+        self.min_samples = min_samples
+        self.metric = metric
+        self.drop_noise = drop_noise
+        self.min_cluster_size = min_cluster_size
+        self.keep_if_all_filtered = keep_if_all_filtered
+
+    def filter(self, documents: Sequence, final_k: int) -> list:
+        if len(documents) <= self.min_samples:
+            return list(documents[:final_k])
+
+        embeddings = np.asarray(
+            self.embedding_function.embed_documents(
+                [document.page_content for document in documents]
+            ),
+            dtype=np.float32,
+        )
+        if self.metric == "cosine":
+            embeddings = normalize(embeddings)
+
+        labels = DBSCAN(
+            eps=self.eps,
+            min_samples=self.min_samples,
+            metric=self.metric,
+        ).fit_predict(embeddings)
+        cluster_sizes = Counter(labels)
+        kept = []
+        for document, label, retrieval_rank in zip(
+            documents,
+            labels,
+            range(len(documents)),
+        ):
+            is_noise = label == -1
+            is_small_cluster = (
+                label != -1 and cluster_sizes[label] < self.min_cluster_size
+            )
+            if self.drop_noise and is_noise:
+                continue
+            if is_small_cluster:
+                continue
+            kept.append((retrieval_rank, document))
+
+        if not kept and self.keep_if_all_filtered:
+            kept = list(enumerate(documents))
+
+        kept.sort(key=lambda item: item[0])
+        print(
+            f"DBSCAN defense removed {len(documents) - len(kept)} "
+            f"of {len(documents)} retrieved documents"
+        )
+        return [document for _, document in kept[:final_k]]
+
+
+@dataclass
+class RetrievedDoc:
+    doc_id: str
+    text: str
+    embedding: np.ndarray
+    metadata: Dict[str, Any]
+    retrieval_rank: int
+    retrieval_distance: Optional[float] = None
+
+
+class DBSCANRetrievalFilter:
+    def __init__(
+        self,
+        eps: float = 0.18,
+        min_samples: int = 3,
+        metric: str = "cosine",
+        drop_noise: bool = True,
+        min_cluster_size: int = 2,
+        keep_if_all_filtered: bool = True,
+    ) -> None:
+        if eps <= 0:
+            raise ValueError("DBSCAN eps must be positive")
+        if min_samples < 1:
+            raise ValueError("DBSCAN min_samples must be at least 1")
+        if min_cluster_size < 1:
+            raise ValueError("DBSCAN min_cluster_size must be at least 1")
+        if metric not in {"cosine", "euclidean"}:
+            raise ValueError("DBSCAN metric must be 'cosine' or 'euclidean'")
+
+        self.eps = eps
+        self.min_samples = min_samples
+        self.metric = metric
+        self.drop_noise = drop_noise
+        self.min_cluster_size = min_cluster_size
+        self.keep_if_all_filtered = keep_if_all_filtered
+
+    def filter(
+        self,
+        docs: List[RetrievedDoc],
+        final_k: int = 5,
+    ) -> List[RetrievedDoc]:
+        if len(docs) <= self.min_samples:
+            return docs[:final_k]
+
+        embeddings = np.vstack([doc.embedding for doc in docs])
+        if self.metric == "cosine":
+            embeddings = normalize(embeddings)
+
+        labels = DBSCAN(
+            eps=self.eps,
+            min_samples=self.min_samples,
+            metric=self.metric,
+        ).fit_predict(embeddings)
+        cluster_sizes = Counter(labels)
+        kept = []
+        for doc, label in zip(docs, labels):
+            is_noise = label == -1
+            is_small_cluster = (
+                label != -1 and cluster_sizes[label] < self.min_cluster_size
+            )
+            if self.drop_noise and is_noise:
+                continue
+            if is_small_cluster:
+                continue
+            kept.append(doc)
+
+        if not kept and self.keep_if_all_filtered:
+            kept = docs
+
+        kept = sorted(kept, key=lambda doc: doc.retrieval_rank)
+        return kept[:final_k]
+
+
+def calibrate_dbscan_retrieval_filter(
+    clean_query_results: List[List[RetrievedDoc]],
+    eps_grid,
+    min_samples_grid,
+    target_false_positive_rate: float = 0.02,
+    metric: str = "cosine",
+) -> dict:
+    """Select the most aggressive DBSCAN setting within a clean FPR budget."""
+    if not 0 <= target_false_positive_rate <= 1:
+        raise ValueError("target_false_positive_rate must be between 0 and 1")
+    if metric not in {"cosine", "euclidean"}:
+        raise ValueError("DBSCAN metric must be 'cosine' or 'euclidean'")
+
+    records = []
+    for eps in eps_grid:
+        for min_samples in min_samples_grid:
+            defense = DBSCANRetrievalFilter(
+                eps=eps,
+                min_samples=min_samples,
+                metric=metric,
+                drop_noise=True,
+                min_cluster_size=2,
+                keep_if_all_filtered=True,
+            )
+            total_docs = 0
+            removed_docs = 0
+            for pool in clean_query_results:
+                kept_ids = {doc.doc_id for doc in defense.filter(pool, len(pool))}
+                total_docs += len(pool)
+                removed_docs += sum(doc.doc_id not in kept_ids for doc in pool)
+
+            records.append(
+                {
+                    "eps": eps,
+                    "min_samples": min_samples,
+                    "clean_false_positive_rate": (
+                        removed_docs / total_docs if total_docs else 1.0
+                    ),
+                }
+            )
+
+    if not records:
+        raise ValueError("eps_grid and min_samples_grid must contain values")
+
+    valid = [
+        record
+        for record in records
+        if record["clean_false_positive_rate"] <= target_false_positive_rate
+    ]
+    if not valid:
+        return min(valid or records, key=lambda record: record["clean_false_positive_rate"])
+    return min(valid, key=lambda record: record["eps"])
 
 def extract_phrases(text: str, min_words: int) -> List[str]:
     words = normalize_text(text).split()
@@ -386,80 +502,6 @@ def normalize_text(text: str) -> str:
 
 from itertools import combinations
 
-def drop_template_documents(
-    documents: Sequence,
-    min_words: int = 6,
-    min_doc_frequency: int = 3,
-    df_ratio: float = 0.02,
-    min_template_shingles: int = 3,
-) -> list:
-    """Symmetric boilerplate defense.
-
-    All statistics come from the batch being screened:
-      1. A shingle is 'widely shared' if it appears in >= df_floor documents,
-         df_floor = max(min_doc_frequency, df_ratio * N).
-      2. A document is dropped only if it contains min_template_shingles
-         widely shared shingles whose co-occurrence appears in >= df_floor
-         documents — i.e. it instantiates a repeated template, rather than
-         merely using common phrases.
-    """
-    n_docs = len(documents)
-    df_floor = max(min_doc_frequency, math.ceil(df_ratio * n_docs))
-
-    shingle_docs: dict[str, set[int]] = defaultdict(set)
-    doc_shingles: list[set[str]] = []
-    for doc_index, document in enumerate(documents):
-        shingles = set(extract_phrases(document.page_content, min_words))
-        doc_shingles.append(shingles)
-        for shingle in shingles:
-            shingle_docs[shingle].add(doc_index)
-
-    shared = {
-        shingle
-        for shingle, doc_indices in shingle_docs.items()
-        if len(doc_indices) >= df_floor
-    }
-    print(
-        f"Template defense: {n_docs} docs | df_floor={df_floor} | "
-        f"{len(shared)} widely shared {min_words}-gram shingles"
-    )
-
-    dropped, kept = [], []
-    templates: dict[tuple[str, ...], int] = {}
-    for doc_index, document in enumerate(documents):
-        hits = sorted(doc_shingles[doc_index] & shared)
-        triggered = None
-        if len(hits) >= min_template_shingles:
-            for combo in combinations(hits, min_template_shingles):
-                support = shingle_docs[combo[0]]
-                for shingle in combo[1:]:
-                    support = support & shingle_docs[shingle]
-                    if len(support) < df_floor:
-                        break
-                if len(support) >= df_floor:
-                    triggered = combo
-                    templates[combo] = len(support)
-                    break
-        if triggered is not None:
-            dropped.append((doc_index, triggered))
-        else:
-            kept.append(document)
-
-    if templates:
-        print(f"Template defense: {len(templates)} repeated template(s):")
-        for combo, support in sorted(templates.items(), key=lambda kv: -kv[1])[:10]:
-            print(f"    support={support:4d}  {combo}")
-    if dropped:
-        print(f"Template defense dropped {len(dropped)} of {n_docs} documents:")
-        for doc_index, _ in dropped[:10]:
-            preview = " ".join((documents[doc_index].page_content or "").split())
-            print(f"  * dropped doc[{doc_index}]: {preview[:140]}")
-        if len(dropped) > 10:
-            print(f"    ... and {len(dropped) - 10} more")
-    else:
-        print("Template defense: nothing dropped")
-    return kept
-
 def run(args: argparse.Namespace) -> None:
     import pandas as pd
     from tqdm import tqdm
@@ -502,8 +544,7 @@ def run(args: argparse.Namespace) -> None:
             )
 
         if args.duplicate_defense:
-            raw_documents = drop_template_documents(raw_documents)
-            """clusters = shared_phrase_clusters(
+            clusters = shared_phrase_clusters(
                 raw_documents,
                 similarity_threshold=0.80,
                 min_documents=10,
@@ -513,14 +554,6 @@ def run(args: argparse.Namespace) -> None:
                 raw_documents,
                 clusters,
                 max_documents=10,
-            )"""
-
-        if args.clustering_defense:
-            clusters = shared_semantic_clusters(raw_documents, embedding.embed_documents)
-            raw_documents = drop_shared_phrase_documents(
-                raw_documents,
-                clusters,
-                max_documents=35,
             )
 
         chunks = splitter.split_documents(raw_documents)
@@ -533,8 +566,7 @@ def run(args: argparse.Namespace) -> None:
 
     poisoned_documents, topics = load_poisoned_documents(args.poisoned_docs, Document)
     if args.duplicate_defense:
-        poisoned_documents = drop_template_documents(poisoned_documents)
-        """clusters = shared_phrase_clusters(
+        clusters = shared_phrase_clusters(
                 poisoned_documents,
                 similarity_threshold=0.80,
                 min_documents=10,
@@ -544,7 +576,7 @@ def run(args: argparse.Namespace) -> None:
                 poisoned_documents,
                 clusters,
                 max_documents=10,
-        )"""
+        )
 
     if args.condition == "poisoned":
         if args.poisoned_db is None:
@@ -561,6 +593,57 @@ def run(args: argparse.Namespace) -> None:
     else:
         active_store = clean_store
 
+    if args.dbscan_calibrate:
+        calibration_pools = []
+        calibration_k = args.top_k * max(5, args.top_k)
+        for query_index, query in enumerate(topics):
+            clean_results = clean_store.similarity_search_with_score(
+                query,
+                k=calibration_k,
+            )
+            clean_documents = [document for document, _ in clean_results]
+            clean_embeddings = embedding.embed_documents(
+                [document.page_content for document in clean_documents]
+            )
+            calibration_pools.append(
+                [
+                    RetrievedDoc(
+                        doc_id=f"{query_index}:{rank}",
+                        text=document.page_content,
+                        embedding=np.asarray(vector, dtype=np.float32),
+                        metadata=document.metadata,
+                        retrieval_rank=rank,
+                        retrieval_distance=float(distance),
+                    )
+                    for rank, ((document, distance), vector) in enumerate(
+                        zip(clean_results, clean_embeddings)
+                    )
+                ]
+            )
+
+        selected_dbscan = calibrate_dbscan_retrieval_filter(
+            clean_query_results=calibration_pools,
+            eps_grid=args.dbscan_eps_grid,
+            min_samples_grid=args.dbscan_min_samples_grid,
+            target_false_positive_rate=args.dbscan_target_fpr,
+            metric=args.dbscan_metric,
+        )
+        args.dbscan_eps = float(selected_dbscan["eps"])
+        args.dbscan_min_samples = int(selected_dbscan["min_samples"])
+        print(f"Calibrated DBSCAN parameters: {selected_dbscan}")
+
+    dbscan_filter = None
+    if args.dbscan_defense:
+        dbscan_filter = DBSCANDocumentFilter(
+            embedding_function=embedding,
+            eps=args.dbscan_eps,
+            min_samples=args.dbscan_min_samples,
+            metric=args.dbscan_metric,
+            drop_noise=args.dbscan_drop_noise,
+            min_cluster_size=args.dbscan_min_cluster_size,
+            keep_if_all_filtered=args.dbscan_keep_if_all_filtered,
+        )
+
     generator = initialize_generator(
         args.generator,
         args.generator_model,
@@ -569,36 +652,56 @@ def run(args: argparse.Namespace) -> None:
         args.request_retries,
     )
 
+    last_retrieval_metrics = {}
+
+    def calculate_retrieval_metrics(before, after, baseline_top_k):
+        after_ids = {id(document) for document in after}
+        removed = [document for document in before if id(document) not in after_ids]
+        baseline_ids = {id(document) for document in baseline_top_k}
+        disrupted = [document for document in baseline_top_k if id(document) not in after_ids]
+        poisoned = [document for document in before if document.metadata.get("poisoned", False)]
+        clean = [document for document in before if not document.metadata.get("poisoned", False)]
+        poisoned_removed = sum(
+            id(document) not in after_ids for document in poisoned
+        )
+        clean_removed = sum(id(document) not in after_ids for document in clean)
+        return {
+            "retrieval_candidate_count": len(before),
+            "retrieval_baseline_top_k_count": len(baseline_top_k),
+            "retrieval_kept_count": len(after),
+            "retrieval_disruption_count": len(disrupted),
+            "retrieval_disrupted": int(bool(disrupted)),
+            "poisoned_candidate_count": len(poisoned),
+            "poisoned_removed_count": poisoned_removed,
+            "clean_candidate_count": len(clean),
+            "clean_removed_count": clean_removed,
+            "pdr": poisoned_removed / len(poisoned) if poisoned else None,
+            "fpr": clean_removed / len(clean) if clean else None,
+            "rdr": len(disrupted) / len(baseline_ids) if baseline_ids else 0.0,
+        }
+
     def retrieve(query: str):
+        nonlocal last_retrieval_metrics
         print("RETRIEVER QUERY:", repr(query))
 
         n_buffer = 5
-        fetch_k = args.top_k + n_buffer if args.perplexity_defense else args.top_k
+        if args.dbscan_defense:
+            fetch_k = args.top_k * max(n_buffer, args.top_k)
+        else:
+            fetch_k = args.top_k
 
         retrieved = active_store.similarity_search(query, k=fetch_k)
+        baseline_retrieved = list(retrieved)
+        baseline_top_k = baseline_retrieved[: args.top_k]
 
-        if args.perplexity_defense:
-            scorer = GPT2PerplexityScorer(
-                model_name="openai-community/gpt2",
-                device_name="auto",
-                stride=512,
-            )
-            filtered = []
-            removed = 0
-            for item in retrieved:
-                ppl, log_ppl, token_count = scorer.score(item.page_content)
-                if ppl > 45 or ppl < 15:
-                    removed += 1
-                    print(f"Removed document with perplexity score {ppl}:")
-                    print(item.page_content)
-                else:
-                    filtered.append(item)
-            print(f"{removed} documents removed by perplexity filtering")
+        if dbscan_filter is not None:
+            retrieved = dbscan_filter.filter(retrieved, final_k=args.top_k)
 
-            take_k = min(len(filtered), args.top_k)
-            if take_k < args.top_k:
-                print(f"Note: Only {take_k} documents available after filtering (requested top_k={args.top_k}).")
-            retrieved = filtered[:take_k]
+        last_retrieval_metrics = calculate_retrieval_metrics(
+            baseline_retrieved,
+            retrieved,
+            baseline_top_k,
+        )
 
         serialized = "\n\n".join(
             f"Source: {doc.metadata.get('source', 'unknown')}\nContent: {doc.page_content}"
@@ -618,6 +721,7 @@ def run(args: argparse.Namespace) -> None:
     answers = []
     for query_index, query in enumerate(tqdm(topics, desc="Processing queries"), start=1):
         for run_index in range(1, args.runs_per_question + 1):
+            last_retrieval_metrics = {}
             if agent is not None:
                 result = agent.invoke({"messages": [{"role": "user", "content": query}]})
                 tool_outputs = []
@@ -642,6 +746,22 @@ def run(args: argparse.Namespace) -> None:
                 result = generator.invoke(messages)
                 final_answer = result.content if hasattr(result, "content") else str(result)
 
+            retrieval_metrics = {
+                "retrieval_candidate_count": 0,
+                "retrieval_baseline_top_k_count": 0,
+                "retrieval_kept_count": 0,
+                "retrieval_disruption_count": 0,
+                "retrieval_disrupted": 0,
+                "poisoned_candidate_count": 0,
+                "poisoned_removed_count": 0,
+                "clean_candidate_count": 0,
+                "clean_removed_count": 0,
+                "pdr": None,
+                "fpr": None,
+                "rdr": 0.0,
+            }
+            retrieval_metrics.update(last_retrieval_metrics)
+
             answers.append(
                 {
                     "original_query": query,
@@ -650,6 +770,7 @@ def run(args: argparse.Namespace) -> None:
                     "rephrased_query": query,
                     "answer": final_answer,
                     "retrieved_context": retrieved_context,
+                    **retrieval_metrics,
                 }
             )
 
@@ -687,7 +808,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--request-retries", type=int, default=3)
     parser.add_argument("--duplicate-defense", action="store_true")
-    parser.add_argument("--perplexity-defense", action="store_true")
+    parser.add_argument("--dbscan-defense", action="store_true")
+    parser.add_argument("--dbscan-eps", type=float, default=0.18)
+    parser.add_argument("--dbscan-min-samples", type=int, default=3)
+    parser.add_argument("--dbscan-metric", choices=["cosine", "euclidean"], default="cosine")
+    parser.add_argument("--dbscan-min-cluster-size", type=int, default=2)
+    parser.add_argument("--dbscan-drop-noise", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dbscan-keep-if-all-filtered", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dbscan-calibrate", action="store_true")
+    parser.add_argument("--dbscan-eps-grid", type=float, nargs="+", default=[0.12, 0.18, 0.25, 0.35, 0.5, 0.75, 1.01])
+    parser.add_argument("--dbscan-min-samples-grid", type=int, nargs="+", default=[2, 3, 4])
+    parser.add_argument("--dbscan-target-fpr", type=float, default=0.02)
     return parser.parse_args()
 
 

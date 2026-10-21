@@ -207,6 +207,8 @@ class Orchestrator:
                                 "corpora": [path_signature(path) for path in corpus_paths],
                                 "baseline_source": path_signature(baseline_path) if baseline_path else None,
                                 "baseline_config": self.baselines.get(method, {}),
+                                "lof_defense": self.execution.get("lof_defense", False),
+                                "dbscan_defense": self.execution.get("dbscan_defense", False),
                             },
                             16,
                         )
@@ -717,6 +719,48 @@ class Orchestrator:
             command.append("--clustering-defense")
         if self.execution.get("perplexity_defense", False):
             command.append("--perplexity-defense")
+        lof = self.execution.get("lof_defense", False)
+        if isinstance(lof, dict):
+            if lof.get("enabled", True):
+                command.append("--lof-defense")
+                if lof.get("model"):
+                    command.extend(["--lof-model", str(lof["model"])])
+                if lof.get("n_neighbors") is not None:
+                    command.extend(["--lof-neighbors", str(int(lof["n_neighbors"]))])
+                if lof.get("contamination") is not None:
+                    command.extend(["--lof-contamination", str(float(lof["contamination"]))])
+        elif lof:
+            command.append("--lof-defense")
+        dbscan = self.execution.get("dbscan_defense", False)
+        if isinstance(dbscan, dict):
+            if dbscan.get("enabled", True):
+                command.append("--dbscan-defense")
+                for key, option, converter in (
+                    ("eps", "--dbscan-eps", float),
+                    ("min_samples", "--dbscan-min-samples", int),
+                    ("metric", "--dbscan-metric", str),
+                    ("min_cluster_size", "--dbscan-min-cluster-size", int),
+                ):
+                    if dbscan.get(key) is not None:
+                        command.extend([option, str(converter(dbscan[key]))])
+                for key, option in (
+                    ("drop_noise", "--dbscan-drop-noise"),
+                    ("keep_if_all_filtered", "--dbscan-keep-if-all-filtered"),
+                ):
+                    if dbscan.get(key) is not None:
+                        command.extend([option if dbscan[key] else option.replace("--", "--no-", 1)])
+                if dbscan.get("calibrate", False):
+                    command.append("--dbscan-calibrate")
+                    command.extend([
+                        "--dbscan-eps-grid",
+                        *[str(float(value)) for value in dbscan.get("eps_grid", [0.12, 0.18, 0.25, 0.35, 0.5, 0.75, 1.01])],
+                        "--dbscan-min-samples-grid",
+                        *[str(int(value)) for value in dbscan.get("min_samples_grid", [2, 3, 4])],
+                        "--dbscan-target-fpr",
+                        str(float(dbscan.get("target_fpr", 0.02))),
+                    ])
+        elif dbscan:
+            command.append("--dbscan-defense")
         for corpus_file in corpus_files:
             command.extend(["--corpus-file", str(corpus_file)])
         if condition == "poisoned":
